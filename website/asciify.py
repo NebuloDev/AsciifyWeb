@@ -1,232 +1,271 @@
-import cv2
-import math
-from tqdm import tqdm
-from moviepy.editor import VideoFileClip, AudioFileClip
-from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
+import os, shutil, tempfile
+from dataclasses import dataclass, field
 from multiprocessing import Pool, cpu_count
-from PIL import Image, ImageDraw, ImageFont
+
+import cv2
 import numpy as np
-import os
+from PIL import Image, ImageDraw, ImageFont
+from moviepy import VideoFileClip, AudioFileClip
+from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
+from tqdm import tqdm
 
-def asciify_frame(
-        frame, scaleFactor=0.15, oneCharWidth=7, oneCharHeight=9, color_brightness=1, pixel_brightness=2.15, monochrome=False, 
-        overlay_contours=False, contour_depth_minimum_threshold = 0, contour_depth_maximum_threshold = 255, progress_bar=False
-    ):
-    chars = "$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\\|()1{}[]?-_+~<>i!lI;:,\"^`'. "[::-1]
-    charArray = list(chars)
-    charLength = len(charArray)
-    interval = charLength / 256
 
-    contour_chars = "|/-\\_ "
-    
-    def getChar(inputInt):
-        return charArray[math.floor(inputInt * interval)]
-    
-    if frame.shape[2] == 4:
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+CHARS = "$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\\|()1{}[]?-_+~<>i!lI;:,\"^`'. "[::-1]
+CONTOUR_CHARS = "|/-\\"
+FONT = ImageFont.truetype("lucon.ttf", 10)
+
+
+@dataclass
+class AsciiConfig:
+    scale_factor: float = 0.15
+    char_width: int = 7
+    char_height: int = 9
+    color_brightness: float = 1.0
+    pixel_brightness: float = 2.15
+    monochrome: bool = False
+    overlay_contours: bool = False
+    contour_min_threshold: int = 0
+    contour_max_threshold: int = 255
+    low_res_audio: bool = True
+    num_workers: int = field(default_factory=cpu_count)
+
+
+# ---------------------------------------------------------------------------
+# Core frame conversion
+# ---------------------------------------------------------------------------
+
+def _build_char_lut() -> np.ndarray:
+    """Precompute a 256-entry lookup table mapping brightness -> char index."""
+    n = len(CHARS)
+    lut = np.floor(np.arange(256) * (n / 256)).astype(np.int32)
+    lut = np.clip(lut, 0, n - 1)
+    return lut
+
+
+_CHAR_LUT = _build_char_lut()
+
+
+def asciify_frame(frame: np.ndarray, cfg: AsciiConfig) -> np.ndarray:
+    """Convert a single BGR frame to an ASCII-art RGB frame."""
+    # Normalise input
+    if frame.ndim == 3 and frame.shape[2] == 4:
         frame = frame[:, :, :3]
+
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    im = Image.fromarray(frame_rgb)
-    fnt = ImageFont.truetype('lucon.ttf', 10)
 
-    width, height = im.size
-    im = im.resize((int(scaleFactor * width), int(scaleFactor * height * (oneCharWidth / oneCharHeight))), Image.NEAREST)
-    width, height = im.size
-    pix = im.load()
+    # Downscale
+    src_h, src_w = frame_rgb.shape[:2]
+    new_w = max(1, int(cfg.scale_factor * src_w))
+    new_h = max(1, int(cfg.scale_factor * src_h * (cfg.char_width / cfg.char_height)))
+    small = cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
-    outputImage = Image.new('RGB', (int(oneCharWidth * width), int(oneCharHeight * height)), color=(0, 0, 0))
-    d = ImageDraw.Draw(outputImage)
+    # Grayscale + brightness
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)  # correct channel order
 
-    gray = cv2.cvtColor(np.array(im), cv2.COLOR_BGR2GRAY)
+    # Weighted luminance (same coefficients as before but vectorised)
+    r, g, b = small[:, :, 0], small[:, :, 1], small[:, :, 2]
+    lum = (0.299 * cfg.color_brightness * r
+           + 0.587 * cfg.color_brightness * g
+           + 0.114 * cfg.color_brightness * b)
+    lum = np.clip(lum * cfg.pixel_brightness, 0, 255).astype(np.uint8)
 
-    depth = cv2.Laplacian(gray, cv2.CV_64F)
-    depth = cv2.convertScaleAbs(depth)
-    
-    _, depth_mask = cv2.threshold(depth, max(0, contour_depth_minimum_threshold), min(255, contour_depth_maximum_threshold), cv2.THRESH_BINARY)
-    
-    grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    edges = cv2.Canny(gray, 50, 70)
+    # Map each pixel to a character via LUT
+    char_indices = _CHAR_LUT[lum]  # shape (new_h, new_w)
 
-    for i in tqdm(range(height), disable=not progress_bar, leave=False):
-        for j in tqdm(range(width), disable=not progress_bar, leave=False):
-            r, g, b = pix[j, i]
-            
-            mult_r = 0.299 * color_brightness
-            mult_g = 0.587 * color_brightness
-            mult_b = 0.114 * color_brightness
-            
-            h = int(mult_r * r + mult_g * g + mult_b * b)
-            h = min(255, int(h * pixel_brightness))
-            
-            char = getChar(h)
-            
-            if overlay_contours and edges[i, j] > 0 and depth_mask[i, j] > 0:
-                angle = cv2.phase(grad_x[i, j], grad_y[i, j], angleInDegrees=True)[0] % 180
-                if angle < 45:
-                    char = contour_chars[0]  # |
-                elif angle < 90:
-                    char = contour_chars[1]  # /
-                elif angle < 135:
-                    char = contour_chars[2]  # -
+    # Contour / edge detection
+    contour_map = None
+    if cfg.overlay_contours:
+        depth = cv2.Laplacian(gray, cv2.CV_64F)
+        depth = cv2.convertScaleAbs(depth)
+        _, depth_mask = cv2.threshold(
+            depth,
+            cfg.contour_min_threshold,
+            cfg.contour_max_threshold,
+            cv2.THRESH_BINARY,
+        )
+        edges = cv2.Canny(gray, 50, 70)
+
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        angles = cv2.phase(grad_x, grad_y, angleInDegrees=True) % 180
+
+        contour_mask = (edges > 0) & (depth_mask > 0)
+        contour_map = (angles, contour_mask)
+
+    # Render to image
+    out_w = cfg.char_width * new_w
+    out_h = cfg.char_height * new_h
+    output = Image.new("RGB", (out_w, out_h), color=(0, 0, 0))
+    draw = ImageDraw.Draw(output)
+
+    colors = small if not cfg.monochrome else np.stack([lum, lum, lum], axis=-1)
+
+    for i in range(new_h):
+        for j in range(new_w):
+            if contour_map is not None:
+                angles_map, cmask = contour_map
+                if cmask[i, j]:
+                    a = angles_map[i, j]
+                    ci = 0 if a < 45 else 1 if a < 90 else 2 if a < 135 else 3
+                    char = CONTOUR_CHARS[ci]
                 else:
-                    char = contour_chars[3]  # \
-                        
-            rgb = (r,g,b)
-            
-            if monochrome:
-                rgb = (h,h,h)
+                    char = CHARS[char_indices[i, j]]
+            else:
+                char = CHARS[char_indices[i, j]]
 
-            d.text((j * oneCharWidth, i * oneCharHeight), char, font=fnt, fill=rgb, align="center")
-    
-    outputImage = outputImage.convert('RGB')
-    output_frame = np.array(outputImage)
-    return output_frame
+            rgb = tuple(int(c) for c in colors[i, j])
+            draw.text((j * cfg.char_width, i * cfg.char_height), char, font=FONT, fill=rgb)
 
-def convert_frame(args):
-    return asciify_frame(*args)
+    return np.array(output)
+
+
+# Multiprocessing shim: pool.imap requires a top-level picklable callable
+def _convert_frame_worker(args):
+    frame, cfg = args
+    return asciify_frame(frame, cfg)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def ascii_photo(
-        in_path, final_path, scaleFactor=0.15, oneCharWidth=7, oneCharHeight=9, color_brightness=1, pixel_brightness=2.15, monochrome=False, 
-        overlay_contours=False, contour_depth_minimum_threshold = 0, contour_depth_maximum_threshold = 255, progress_bar=False
-    ):
+    in_path: str,
+    out_path: str,
+    cfg: AsciiConfig | None = None,
+    progress_bar: bool = False,
+) -> None:
     """
-    Asciifies a photo from a path, and saves it to a file.
+    Convert a single image to ASCII art and save it.
 
-    Parameters:
-    - in_path: String.
-        Relative path to the input image.
-    - final_path: String.
-        Relative path to the output image. Doesn't need to exist.
-    - scaleFactor: Float.
-        Controls the image quality in the ASCII image.
-        Default is 0.15.
-    - oneCharWidth: Int.
-        Width of one character in the ASCII representation.
-        Default is 7.
-    - oneCharHeight: Int.
-        Height of one character in the ASCII representation.
-        Default is 9.
-    - color_brightness: Float.
-        Specify brightness multiplier of colors in calculations.
-        Default is 1.
-    - pixel_brightness: Float.
-        Specify brightness multiplier of the drawn pixels in the frame.
-        Default is 2.15.
-    - monochrome: Bool.
-        If True, a frames are rendered using only grayscale colors.
-        Default is False.
-    - overlay_contours: Bool.
-        If True, overlays contours on the image.
-        Default is False.
-    - contour_depth_minimum_threshold: Float.
-        Specify the minimum threshold of the depth map for when point contours are drawn. Must be between (0-255).
-        Default is 0.
-    - contour_depth_maximum_threshold: Float.
-        Specify the maximum threshold of the depth map for when point contours are drawn. Must be between (0-255).
-        Default is 255.
-    - progress_bar: Bool.
-        If True, displays a progress bar in the console.
-        Default is False.
-        
-    Returns: Void.
+    Parameters
+    ----------
+    in_path  : path to the input image
+    out_path : path to save the output image
+    cfg      : AsciiConfig (uses defaults if None)
+    progress_bar : print status messages
     """
-    
     if not os.path.exists(in_path):
-        print("Invalid input path.")
-        return
+        raise FileNotFoundError(f"Input file not found: {in_path}")
 
-    cap = cv2.imread(in_path)
-    frame_args = (
-        cap, scaleFactor, oneCharWidth, oneCharHeight, color_brightness, pixel_brightness, monochrome, 
-        overlay_contours, contour_depth_minimum_threshold, contour_depth_maximum_threshold, progress_bar
-    )
-    ascii_frame = Image.fromarray(convert_frame(frame_args), 'RGB')
-    ascii_frame.save(final_path)
-    if progress_bar: 
-        print(f"Saved asciified photo to {final_path}")
+    cfg = cfg or AsciiConfig()
+    frame = cv2.imread(in_path)
+    if frame is None:
+        raise ValueError(f"Could not read image: {in_path}")
+
+    result = asciify_frame(frame, cfg)
+    Image.fromarray(result, "RGB").save(out_path)
+
+    if progress_bar:
+        print(f"Saved ASCII photo to {out_path}")
 
 
 def ascii_video(
-        in_path, final_path, scaleFactor = 0.15, oneCharWidth = 7, oneCharHeight = 9, color_brightness=1, pixel_brightness=2.15, monochrome=False, 
-        overlay_contours = False, contour_depth_minimum_threshold = 0, contour_depth_maximum_threshold = 255, low_res_audio = True, progress_bar = True, num_workers=None
-    ):
+    in_path: str,
+    out_path: str,
+    cfg: AsciiConfig | None = None,
+    progress_bar: bool = True,
+    chunk_size: int = 64,
+) -> None:
     """
-    Asciifies a video from a path, and saves it to a file.
-    """
+    Convert a video to ASCII art and save it, including audio.
 
+    Parameters
+    ----------
+    in_path      : path to the input video
+    out_path     : path to save the output video
+    cfg          : AsciiConfig (uses defaults if None)
+    progress_bar : show tqdm progress bars
+    chunk_size   : number of frames to hold in memory at once
+    """
     if not os.path.exists(in_path):
-        print("Invalid input path.")
-        return
+        raise FileNotFoundError(f"Input file not found: {in_path}")
+
+    cfg = cfg or AsciiConfig()
 
     cap = cv2.VideoCapture(in_path)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_rate = cap.get(cv2.CAP_PROP_FPS)
-
     if not cap.isOpened():
-        print('Cap is not open')
-        return
+        raise RuntimeError(f"Could not open video: {in_path}")
 
-    if num_workers is None:
-        num_workers = cpu_count()
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
 
-    frame_args = []
-    for current_frame in tqdm(range(1, frame_count + 1), desc="Processing frames", disable = not progress_bar, leave=False):
-        ret, frame = cap.read()
-        if ret:
-            frame_args.append((
-                frame, scaleFactor, oneCharWidth, oneCharHeight, color_brightness, pixel_brightness, monochrome, 
-                overlay_contours, contour_depth_minimum_threshold, contour_depth_maximum_threshold, False
-            ))
-        else:
-            break
+    # Read a single frame to determine output dimensions
+    ret, probe = cap.read()
+    if not ret:
+        raise RuntimeError("Could not read any frames from video.")
+    probe_out = asciify_frame(probe, cfg)
+    out_h, out_w = probe_out.shape[:2]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    cap.release()
-
-    with Pool(num_workers) as pool:
-        ascii_frames = list(tqdm(pool.imap(convert_frame, frame_args), total=len(frame_args), desc="Converting frames", disable = not progress_bar, leave=False))
-        pool.close()
-        pool.join()
-
-    temp_video_path = "temp.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    output_video = cv2.VideoWriter(temp_video_path, fourcc, frame_rate, (ascii_frames[0].shape[1], ascii_frames[0].shape[0]))
-
-    for frame in tqdm(ascii_frames, desc="Saving video", disable = not progress_bar, leave=False):
-        output_video.write(frame)
-    
-    output_video.release()
-
+    # Audio
     original_clip = VideoFileClip(in_path)
-    original_audio = original_clip.audio
-    
-    clip = VideoFileClip(temp_video_path)
-    clip = clip.to_RGB()
-    fps = clip.fps
+    audio_tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    audio_tmp.close()
 
-    temp_audio_path = "temp_audio.mp3"
-    temp_audio_low_path = "temp_audio_low.mp3"
-
-    if low_res_audio:
-        low_audio = original_audio.set_fps(8000)
-        low_audio.write_audiofile(temp_audio_low_path, verbose=False, logger=None)
-        
-        audio = AudioFileClip(temp_audio_low_path)
-        audio = audio.set_fps(16000)
-        audio.write_audiofile(temp_audio_path, verbose=False, logger=None)
+    if cfg.low_res_audio:
+        low = original_clip.audio.with_fps(8000)
+        low.write_audiofile(audio_tmp.name, logger=None)
+        audio = AudioFileClip(audio_tmp.name).with_fps(16000)
+        audio_final_tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        audio_final_tmp.close()
+        audio.write_audiofile(audio_final_tmp.name, logger=None)
+        audio_path = audio_final_tmp.name
+        os.remove(audio_tmp.name)
     else:
-        original_audio.write_audiofile(temp_audio_path, verbose=False, logger=None)
+        original_clip.audio.write_audiofile(audio_tmp.name, logger=None)
+        audio_path = audio_tmp.name
+        audio_final_tmp = None
 
-    with FFMPEG_VideoWriter(final_path, fps=fps, size=clip.size, codec='libx264', logfile=None, threads=num_workers, audiofile=temp_audio_path, ffmpeg_params=['-strict', '-2']) as writer:
-        frame_iterator = tqdm(clip.iter_frames(fps), total=int(clip.duration*fps), desc = "Adding audio", disable = not progress_bar, leave=False)
+    # Video write loop
+    video_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    video_tmp.close()
 
-        for frame in frame_iterator:
-            writer.write_frame(frame)
+    writer = FFMPEG_VideoWriter(
+        video_tmp.name,
+        fps=fps,
+        size=(out_w, out_h),
+        codec="libx264",
+        logfile=None,
+        threads=cfg.num_workers,
+        audiofile=audio_path,
+        ffmpeg_params=["-strict", "-2"],
+    )
 
-        writer.close()
+    pbar = tqdm(total=frame_count, desc="Converting", disable=not progress_bar)
 
-    clip.close()
+    with Pool(cfg.num_workers) as pool:
+        # Stream chunks through the pool to keep memory bounded
+        chunk: list[tuple[np.ndarray, AsciiConfig]] = []
+
+        def flush_chunk():
+            for ascii_frame in pool.imap(_convert_frame_worker, chunk):
+                writer.write_frame(ascii_frame)
+                pbar.update(1)
+            chunk.clear()
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            chunk.append((frame, cfg))
+            if len(chunk) >= chunk_size:
+                flush_chunk()
+
+        if chunk:
+            flush_chunk()
+
+    pbar.close()
+    cap.release()
+    writer.close()
+
+    # Cleanup
     original_clip.close()
-    os.remove(temp_video_path)
-    if low_res_audio: os.remove(temp_audio_low_path)
-    os.remove(temp_audio_path)
+    shutil.move(video_tmp.name, out_path)
+    os.remove(audio_path)
+    if audio_final_tmp and os.path.exists(audio_final_tmp.name):
+        os.remove(audio_final_tmp.name)
